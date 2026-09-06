@@ -1,0 +1,282 @@
+/**
+ * Faculty API Module
+ *
+ * Provides API functions for faculty-specific operations including:
+ * - Retrieving faculty's own submitted examination papers
+ * - Creating new exam paper submissions with file uploads
+ * - Editing existing exam paper submissions
+ *
+ * Handles atomic file uploads with automatic rollback on failure to maintain data consistency.
+ *
+ * @module apiFaculty
+ */
+
+// Import your Supabase client and constants
+import { PAGE_SIZE } from "../utils/constants";
+import supabase, { supabaseUrl } from "./supabase";
+
+/**
+ * Fetches a paginated, descending list of exam papers submitted by a specific faculty member.
+ *
+ * Returns only papers uploaded by the specified employee, ordered by creation date (newest first).
+ * Includes essential fields for faculty dashboard display. Supports pagination for large datasets.
+ *
+ * @async
+ * @param {Object} params - Query parameters
+ * @param {number} [params.page] - Page number for pagination (1-based)
+ * @param {string} params.employee_id - Employee ID of the faculty member
+ * @returns {Promise<Object>} Paginated papers and total count
+ * @returns {Array<Object>} returns.data - Array of exam paper objects
+ * @returns {number} returns.data[].id - Paper unique identifier
+ * @returns {string} returns.data[].subject_code - Subject code
+ * @returns {string} returns.data[].academic_year - Academic year
+ * @returns {string} returns.data[].subject_name - Subject name
+ * @returns {string} returns.data[].semester - Semester value
+ * @returns {('Submitted'|'CoE-approved'|'BoE-approved'|'Locked')} returns.data[].status - Paper status
+ * @returns {number} returns.count - Total count of papers uploaded by this faculty member
+ * @throws {Error} If papers cannot be loaded from database
+ *
+ * @example
+ * // Get first page of faculty's papers
+ * const result = await getPapers({ page: 1, employee_id: 'FAC001' });
+ * console.log(`Faculty has ${result.count} papers`);
+ *
+ * @example
+ * // Display all papers without pagination
+ * const result = await getPapers({ employee_id: 'FAC001' });
+ * result.data.forEach(paper => {
+ *   console.log(`${paper.subject_code}: ${paper.status}`);
+ * });
+ */
+export async function getPapers({ page, employee_id }) {
+  // Start building the query: select all columns, return total count, order by newest first
+  let query = supabase
+    .from("exam_papers")
+    .select("id, subject_code,academic_year,subject_name,semester,status", {
+      count: "exact",
+    })
+    .eq("uploaded_by", employee_id)
+    .order("created_at", { ascending: false });
+
+  // If page param exists, add a range for pagination
+  if (page) {
+    const from = (page - 1) * PAGE_SIZE; // Index of first row on this page
+    const to = from + PAGE_SIZE - 1; // Index of last row on this page
+    query = query.range(from, to);
+  }
+
+  // Actually execute the built query
+  const { data, error, count } = await query;
+
+  // Handle DB errors (network, permission, etc)
+  if (error) {
+    throw new Error("Papers could not be loaded!");
+  }
+
+  // Return both the data (array of rows) and total result count
+  return { data, count };
+}
+
+/**
+ * Creates a new exam paper submission or edits an existing one.
+ *
+ * Handles complete exam paper submission workflow:
+ * - Uploads Question Paper and Scheme of Valuation files to storage
+ * - Creates/updates database record with metadata
+ * - Implements atomic operations with automatic rollback on failure
+ * - Supports partial updates (only uploads new files if provided)
+ *
+ * File upload behavior:
+ * - New submission: Both QP and Scheme files are required and uploaded
+ * - Edit operation: Only uploads files if new ones are provided in the form
+ * - Existing file URLs are preserved if no new files are selected
+ * - Uses upsert strategy to replace files at same path
+ *
+ * Storage structure: papers/Academic Year YYYY/Department/SemX/Subject Name/
+ *
+ * Atomic operation guarantee:
+ * - If Scheme upload fails, QP file is automatically removed
+ * - If database insert/update fails, newly uploaded files are removed
+ * - Prevents orphaned files in storage
+ *
+ * @async
+ * @param {Object} newPaper - Form data containing paper metadata and files
+ * @param {FileList} [newPaper.qp_file] - Question Paper file array (DOCX format, max 10MB)
+ * @param {FileList} [newPaper.scheme_file] - Scheme of Valuation file array (DOCX format, max 10MB)
+ * @param {string} newPaper.subject_code - Unique subject code
+ * @param {string} newPaper.subject_name - Full subject name
+ * @param {string} newPaper.semester - Semester value (e.g., "5", "7")
+ * @param {string|number} newPaper.academic_year - Academic year (e.g., 2024)
+ * @param {string} newPaper.department_name - Department name
+ * @param {string} [newPaper.qp_file_url] - Existing QP file URL (for edit operations)
+ * @param {string} [newPaper.scheme_file_url] - Existing Scheme file URL (for edit operations)
+ * @param {string} [newPaper.qp_file_type] - Existing QP file MIME type
+ * @param {string} [newPaper.scheme_file_type] - Existing Scheme file MIME type
+ * @param {string} newPaper.uploaded_by - Employee ID of the faculty member
+ * @param {number} [id] - Paper ID for edit operations (undefined/null for new submissions)
+ * @returns {Promise<Object>} Saved exam paper record from database with all fields
+ * @throws {Error} If file upload fails or database operation fails (triggers automatic cleanup)
+ *
+ * @example
+ * // Create new paper submission
+ * const formData = {
+ *   qp_file: qpFileList,
+ *   scheme_file: schemeFileList,
+ *   subject_code: 'CS501',
+ *   subject_name: 'Data Structures',
+ *   semester: '5',
+ *   academic_year: 2024,
+ *   department_name: 'Computer Science',
+ *   uploaded_by: 'FAC001'
+ * };
+ * const newPaper = await createEditPapers(formData);
+ * console.log('Paper created with ID:', newPaper.id);
+ *
+ * @example
+ * // Edit existing paper (only update QP file, keep existing Scheme)
+ * const editData = {
+ *   qp_file: newQpFileList,
+ *   subject_code: 'CS501',
+ *   subject_name: 'Data Structures',
+ *   semester: '5',
+ *   academic_year: 2024,
+ *   department_name: 'Computer Science',
+ *   qp_file_url: 'https://existing-url.com/qp.docx',
+ *   scheme_file_url: 'https://existing-url.com/scheme.docx',
+ *   qp_file_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+ *   scheme_file_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+ *   uploaded_by: 'FAC001'
+ * };
+ * const updatedPaper = await createEditPapers(editData, 123);
+ *
+ * @example
+ * // With error handling
+ * try {
+ *   const paper = await createEditPapers(formData);
+ *   console.log('Paper submitted successfully');
+ * } catch (error) {
+ *   if (error.message.includes('Question Paper')) {
+ *     alert('Failed to upload QP file. Please try again.');
+ *   } else if (error.message.includes('Scheme')) {
+ *     alert('Failed to upload Scheme file. Please try again.');
+ *   } else {
+ *     alert('Submission failed. Please contact support.');
+ *   }
+ * }
+ */
+export async function createEditPapers(newPaper, id) {
+  const {
+    qp_file,
+    scheme_file,
+    declaration_file,
+    subject_code,
+    subject_name,
+    semester,
+    academic_year,
+    department_name,
+    qp_file_url: existingQpFileUrl, // Add these to form defaults
+    scheme_file_url: existingSchemeFileUrl, // (these are from DB/form)
+    declaration_file_url: existingDeclarationFileUrl,
+    uploaded_by,
+  } = newPaper;
+
+  const folderPath = `Academic Year ${academic_year}/${department_name}/Sem${semester}/${subject_name}/${uploaded_by}`;
+
+  // Question Paper - Only upload if a new file is provided
+  let qp_file_url = existingQpFileUrl;
+  if (qp_file && qp_file.length > 0) {
+    const qpFilename = `papers/${folderPath}/QP.docx`;
+    const { error: qpError } = await supabase.storage
+      .from("papers")
+      .upload(qpFilename, qp_file[0], { cacheControl: "3600", upsert: true });
+    if (qpError) throw new Error("Failed to upload Question Paper");
+    qp_file_url = `${supabaseUrl}/storage/v1/object/public/papers/${qpFilename}`;
+  }
+
+  // Scheme File - Only upload if a new file is provided
+  let scheme_file_url = existingSchemeFileUrl;
+  if (scheme_file && scheme_file.length > 0) {
+    const schemeFilename = `papers/${folderPath}/Scheme.docx`;
+    const { error: schemeError } = await supabase.storage
+      .from("papers")
+      .upload(schemeFilename, scheme_file[0], {
+        cacheControl: "3600",
+        upsert: true,
+      });
+    if (schemeError) {
+      // If QP file was just uploaded new, remove it to avoid orphan
+      if (qp_file && qp_file.length > 0) {
+        const qpFilename = `papers/${folderPath}/QP.docx`;
+        await supabase.storage.from("papers").remove([qpFilename]);
+      }
+      throw new Error("Failed to upload Scheme of Valuation");
+    }
+    scheme_file_url = `${supabaseUrl}/storage/v1/object/public/papers/${schemeFilename}`;
+  }
+
+  // Declaration image upload
+  let declaration_file_url = existingDeclarationFileUrl;
+  if (declaration_file && declaration_file.length > 0) {
+    const declarationFilename = `declarations/${folderPath}/Declaration.${declaration_file[0].name
+      .split(".")
+      .pop()}`;
+    const { error: declarationError } = await supabase.storage
+      .from("declarations")
+      .upload(declarationFilename, declaration_file[0], {
+        cacheControl: "3600",
+        upsert: true,
+      });
+    if (declarationError) {
+      if (qp_file && qp_file.length > 0) {
+        const qpFilename = `papers/${folderPath}/QP.docx`;
+        await supabase.storage.from("papers").remove([qpFilename]);
+      }
+      if (scheme_file && scheme_file.length > 0) {
+        const schemeFilename = `papers/${folderPath}/Scheme.docx`;
+        await supabase.storage.from("papers").remove([schemeFilename]);
+      }
+      throw new Error("Failed to upload Declaration image");
+    }
+    declaration_file_url = `${supabaseUrl}/storage/v1/object/public/declarations/${declarationFilename}`;
+  }
+
+  // Build the DB row payload (files unchanged unless new selected)
+  const payload = {
+    subject_code,
+    subject_name,
+    semester,
+    academic_year: Number(academic_year),
+    department_name,
+    qp_file_url,
+    scheme_file_url,
+    declaration_file_url,
+    storage_folder_path: folderPath,
+    uploaded_by,
+    status: "Submitted",
+  };
+
+  let query = supabase.from("exam_papers");
+  query = !id ? query.insert([payload]) : query.update(payload).eq("id", id);
+  const { data, error } = await query.select().single();
+
+  // DB error: remove only new files uploaded in this session!
+  if (error) {
+    if (qp_file && qp_file.length > 0) {
+      const qpFilename = `papers/${folderPath}/QP.docx`;
+      await supabase.storage.from("papers").remove([qpFilename]);
+    }
+    if (scheme_file && scheme_file.length > 0) {
+      const schemeFilename = `papers/${folderPath}/Scheme.docx`;
+      await supabase.storage.from("papers").remove([schemeFilename]);
+    }
+    if (declaration_file && declaration_file.length > 0) {
+      const declarationFilename = `declarations/${folderPath}/Declaration.${declaration_file[0].name
+        .split(".")
+        .pop()}`;
+      await supabase.storage.from("declarations").remove([declarationFilename]);
+    }
+    console.error(error);
+    throw new Error("Could not save paper metadata in DB");
+  }
+  return data;
+}
